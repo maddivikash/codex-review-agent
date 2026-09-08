@@ -42,6 +42,47 @@ import {
   ShieldCheckIcon
 } from "@phosphor-icons/react";
 
+// ── Suggested prompts ─────────────────────────────────────────────────
+
+const SUGGESTED_PROMPTS: { label: string; prompt: string }[] = [
+  {
+    label: "Remember my stack",
+    prompt:
+      "Remember that this project is a TypeScript Worker deployed with Wrangler and GitHub Actions, and that we use structured logging via a logger module."
+  },
+  {
+    label: "Review a fetch with no timeout",
+    prompt: [
+      "Review this TypeScript change, title it 'Add saveUser helper':",
+      "async function saveUser(u) {",
+      "  const r = await fetch(API_URL + '/users', { method: 'POST', body: JSON.stringify(u) });",
+      "  try { return await r.json() } catch (e) {}",
+      "  console.log('saved', u);",
+      "  // TODO handle 5xx",
+      "}"
+    ].join("\n")
+  },
+  {
+    label: "Review a hardcoded secret",
+    prompt: [
+      "Review this Python change, title it 'Add billing client':",
+      "import requests",
+      'API_KEY = "sk-live-4f9a8c2e1b7d6e5f3a2b1c0d9e8f7a6b"',
+      "def charge(customer, amount):",
+      "    r = requests.post('https://api.billing.example/charge', json={'c': customer, 'a': amount}, headers={'Authorization': API_KEY})",
+      "    return r.json()"
+    ].join("\n")
+  },
+  {
+    label: "Which Codex rules do you enforce?",
+    prompt: "Which Codex rules do you enforce?"
+  },
+  {
+    label: "What do you remember?",
+    prompt: "What do you remember about my project?"
+  }
+];
+
 // ── Review rendering ──────────────────────────────────────────────────
 
 type Verdict = ReviewResult["verdict"];
@@ -987,17 +1028,14 @@ function Chat() {
                   title="Paste code, or tell me about your project"
                   contents={
                     <div className="flex flex-wrap justify-center gap-2">
-                      {[
-                        "Remember that this project is a TypeScript Worker deployed with Wrangler and GitHub Actions",
-                        "Review this: async function save(u){ const r = await fetch(API_URL+'/u', {method:'POST', body: JSON.stringify(u)}); try { return await r.json() } catch(e) {} console.log('saved', u) }",
-                        "Which Codex rules do you enforce?",
-                        "What do you remember about my project?"
-                      ].map((prompt) => (
+                      {SUGGESTED_PROMPTS.map(({ label, prompt }) => (
                         <Button
-                          key={prompt}
+                          key={label}
                           variant="outline"
                           size="sm"
                           disabled={isStreaming}
+                          title={prompt}
+                          className="max-w-full"
                           onClick={() => {
                             sendMessage({
                               role: "user",
@@ -1005,7 +1043,7 @@ function Chat() {
                             });
                           }}
                         >
-                          {prompt}
+                          <span className="truncate">{label}</span>
                         </Button>
                       ))}
                     </div>
