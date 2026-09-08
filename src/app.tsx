@@ -3,7 +3,8 @@ import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { MCPServersState } from "agents";
-import type { ChatAgent } from "./server";
+import type { AgentState, ChatAgent } from "./server";
+import type { ReviewResult, ReviewParams } from "./workflow";
 import {
   Badge,
   Button,
@@ -37,8 +38,229 @@ import {
   XIcon,
   WrenchIcon,
   PaperclipIcon,
-  ImageIcon
+  ImageIcon,
+  ShieldCheckIcon
 } from "@phosphor-icons/react";
+
+// ── Review rendering ──────────────────────────────────────────────────
+
+type Verdict = ReviewResult["verdict"];
+
+function verdictVariant(v: Verdict): "success" | "warning" | "destructive" {
+  return v === "approve"
+    ? "success"
+    : v === "block"
+      ? "destructive"
+      : "warning";
+}
+function verdictLabel(v: Verdict): string {
+  return v === "approve"
+    ? "Approve"
+    : v === "block"
+      ? "Blocked"
+      : "Request changes";
+}
+function severityVariant(sev: string): "destructive" | "warning" | "secondary" {
+  return sev === "blocker"
+    ? "destructive"
+    : sev === "warning"
+      ? "warning"
+      : "secondary";
+}
+function scoreBarClass(score: number): string {
+  return score >= 80
+    ? "bg-green-500"
+    : score >= 50
+      ? "bg-amber-500"
+      : "bg-red-500";
+}
+
+function isReviewResult(value: unknown): value is ReviewResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "verdict" in value &&
+    "ruleFindings" in value &&
+    Array.isArray((value as ReviewResult).ruleFindings)
+  );
+}
+
+function ReviewCard({ review }: { review: ReviewResult }) {
+  return (
+    <div className="flex justify-start">
+      <Surface className="max-w-[85%] w-full px-4 py-3 rounded-xl ring ring-kumo-line">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <ShieldCheckIcon size={16} className="text-kumo-brand shrink-0" />
+            <span className="text-sm font-semibold text-kumo-default truncate">
+              {review.title}
+            </span>
+            <Badge variant="secondary">{review.language}</Badge>
+          </div>
+          <Badge variant={verdictVariant(review.verdict)}>
+            {verdictLabel(review.verdict)}
+          </Badge>
+        </div>
+        <div className="flex items-center gap-3 mb-3">
+          <div className="flex-1 h-2 rounded-full bg-kumo-control overflow-hidden">
+            <div
+              className={`h-full rounded-full ${scoreBarClass(review.score)}`}
+              style={{ width: `${review.score}%` }}
+            />
+          </div>
+          <span className="text-xs font-semibold text-kumo-default tabular-nums">
+            {review.score}/100
+          </span>
+        </div>
+        {review.ruleFindings.length > 0 ? (
+          <ul className="space-y-1.5 mb-3">
+            {review.ruleFindings.map((f) => (
+              <li key={f.ruleId} className="flex items-start gap-2 text-xs">
+                <Badge variant={severityVariant(f.severity)}>{f.ruleId}</Badge>
+                <span className="text-kumo-default">
+                  <span className="font-medium">{f.title}</span>{" "}
+                  <span className="text-kumo-subtle">
+                    line{f.lines.length > 1 ? "s" : ""} {f.lines.join(", ")}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="mb-3 text-xs text-kumo-subtle">
+            No Codex rule findings.
+          </div>
+        )}
+        <details className="text-sm">
+          <summary className="cursor-pointer text-xs text-kumo-subtle select-none">
+            Model review (Llama 3.3 on Workers AI)
+          </summary>
+          <p className="mt-2 text-sm text-kumo-default whitespace-pre-wrap leading-relaxed">
+            {review.llmReview}
+          </p>
+        </details>
+        <div className="mt-2 text-[11px] text-kumo-inactive">
+          Review {review.reviewId} · durable workflow: rules → model → score
+        </div>
+      </Surface>
+    </div>
+  );
+}
+
+function ReviewRequestView({ input }: { input: Partial<ReviewParams> }) {
+  return (
+    <div className="flex justify-start">
+      <Surface className="max-w-[85%] w-full px-4 py-2.5 rounded-xl ring ring-kumo-line">
+        <div className="flex items-center gap-2">
+          <GearIcon size={14} className="text-kumo-inactive animate-spin" />
+          <Text size="xs" variant="secondary">
+            Reviewing {input.title ? `"${input.title}"` : "your code"}: running
+            Codex rules, then Llama 3.3...
+          </Text>
+        </div>
+        {input.code && (
+          <pre className="mt-2 font-mono text-xs text-kumo-subtle whitespace-pre-wrap overflow-auto max-h-40">
+            {input.code}
+          </pre>
+        )}
+      </Surface>
+    </div>
+  );
+}
+
+// ── Side panel: memory and reviews ────────────────────────────────────
+
+function SidePanel({
+  state,
+  onForget
+}: {
+  state: AgentState;
+  onForget: (id: string) => void;
+}) {
+  return (
+    <aside className="hidden lg:flex flex-col w-80 shrink-0 border-l border-kumo-line bg-kumo-base overflow-y-auto">
+      <section className="p-4 border-b border-kumo-line">
+        <div className="flex items-center gap-2 mb-3">
+          <BrainIcon size={16} className="text-kumo-brand" />
+          <Text size="sm" bold>
+            Project memory
+          </Text>
+          <Badge variant="secondary">{state.facts.length}</Badge>
+        </div>
+        {state.facts.length === 0 ? (
+          <Text size="xs" variant="secondary">
+            Nothing stored yet. Tell the agent about your stack, CI or
+            conventions and it will remember across sessions.
+          </Text>
+        ) : (
+          <ul className="space-y-2">
+            {state.facts.map((f) => (
+              <li
+                key={f.id}
+                className="group flex items-start gap-2 rounded-lg bg-kumo-control px-3 py-2"
+              >
+                <div className="flex-1 min-w-0">
+                  <Badge variant="outline">{f.topic}</Badge>
+                  <p className="mt-1 text-xs text-kumo-default break-words">
+                    {f.fact}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  aria-label={`Forget: ${f.fact}`}
+                  title="Forget this fact"
+                  onClick={() => onForget(f.id)}
+                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-kumo-inactive hover:text-kumo-danger transition-opacity"
+                >
+                  <XIcon size={14} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      <section className="p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <ShieldCheckIcon size={16} className="text-kumo-brand" />
+          <Text size="sm" bold>
+            Recent reviews
+          </Text>
+          <Badge variant="secondary">{state.reviews.length}</Badge>
+        </div>
+        {state.reviews.length === 0 ? (
+          <Text size="xs" variant="secondary">
+            No reviews yet. Paste a function or a diff into the chat.
+          </Text>
+        ) : (
+          <ul className="space-y-2">
+            {state.reviews.map((r) => (
+              <li
+                key={r.reviewId}
+                className="rounded-lg bg-kumo-control px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-kumo-default truncate">
+                    {r.title}
+                  </span>
+                  <Badge variant={verdictVariant(r.verdict)}>{r.score}</Badge>
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-kumo-subtle">
+                  <span>{verdictLabel(r.verdict)}</span>
+                  <span>
+                    {new Date(r.completedAt).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit"
+                    })}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </aside>
+  );
+}
 
 // ── Attachment helpers ────────────────────────────────────────────────
 
@@ -115,9 +337,12 @@ function ToolIO({ label, value }: { label: string; value: unknown }) {
 
 function ToolPartView({
   part,
+  retried = false,
   addToolApprovalResponse
 }: {
   part: UIMessage["parts"][number];
+  /** A later call to the same tool in this message succeeded. */
+  retried?: boolean;
   addToolApprovalResponse: (response: {
     id: string;
     approved: boolean;
@@ -128,6 +353,31 @@ function ToolPartView({
 
   // Completed
   if (part.state === "output-available") {
+    if (
+      (toolName === "runCodexReview" || toolName === "getReviewResult") &&
+      isReviewResult(part.output)
+    ) {
+      return <ReviewCard review={part.output} />;
+    }
+    if (
+      toolName === "rememberProjectFact" &&
+      typeof part.output === "object" &&
+      part.output
+    ) {
+      const out = part.output as { topic?: string; fact?: string };
+      return (
+        <div className="flex justify-start">
+          <Surface className="max-w-[85%] px-4 py-2 rounded-xl ring ring-kumo-line">
+            <div className="flex items-center gap-2 text-xs">
+              <BrainIcon size={14} className="text-kumo-brand" />
+              <span className="text-kumo-subtle">Remembered</span>
+              {out.topic && <Badge variant="outline">{out.topic}</Badge>}
+              <span className="text-kumo-default">{out.fact}</span>
+            </div>
+          </Surface>
+        </div>
+      );
+    }
     return (
       <div className="flex justify-start">
         <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring ring-kumo-line">
@@ -216,6 +466,18 @@ function ToolPartView({
 
   // Errored
   if (part.state === "output-error") {
+    if (retried) {
+      return (
+        <div className="flex justify-start">
+          <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-kumo-inactive">
+            <XCircleIcon size={12} />
+            <span>
+              {toolName}: first attempt had malformed arguments, retried below
+            </span>
+          </div>
+        </div>
+      );
+    }
     const errorText = part.errorText;
     return (
       <div className="flex justify-start">
@@ -239,6 +501,13 @@ function ToolPartView({
 
   // Executing
   if (part.state === "input-available" || part.state === "input-streaming") {
+    if (toolName === "runCodexReview" && part.state === "input-available") {
+      return (
+        <ReviewRequestView
+          input={(part.input ?? {}) as Partial<ReviewParams>}
+        />
+      );
+    }
     return (
       <div className="flex justify-start">
         <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring ring-kumo-line">
@@ -281,8 +550,17 @@ function Chat() {
   const [isAddingServer, setIsAddingServer] = useState(false);
   const mcpPanelRef = useRef<HTMLDivElement>(null);
 
+  const [panelState, setPanelState] = useState<AgentState>({
+    facts: [],
+    reviews: []
+  });
+
   const agent = useAgent<ChatAgent>({
     agent: "ChatAgent",
+    onStateUpdate: useCallback((state: unknown) => {
+      const next = state as Partial<AgentState> | null;
+      setPanelState({ facts: next?.facts ?? [], reviews: next?.reviews ?? [] });
+    }, []),
     onOpen: useCallback(() => setConnected(true), []),
     onClose: useCallback(() => setConnected(false), []),
     onError: useCallback(
@@ -698,269 +976,298 @@ function Chat() {
         </div>
       </header>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-5 py-6 space-y-5">
-          {messages.length === 0 && (
-            <Empty
-              icon={<ChatCircleDotsIcon size={32} />}
-              title="Paste code, or tell me about your project"
-              contents={
-                <div className="flex flex-wrap justify-center gap-2">
-                  {[
-                    "Remember that this project is a TypeScript Worker deployed with Wrangler and GitHub Actions",
-                    "Review this: async function save(u){ const r = await fetch(API_URL+'/u', {method:'POST', body: JSON.stringify(u)}); try { return await r.json() } catch(e) {} console.log('saved', u) }",
-                    "Which Codex rules do you enforce?",
-                    "What do you remember about my project?"
-                  ].map((prompt) => (
-                    <Button
-                      key={prompt}
-                      variant="outline"
-                      size="sm"
-                      disabled={isStreaming}
-                      onClick={() => {
-                        sendMessage({
-                          role: "user",
-                          parts: [{ type: "text", text: prompt }]
-                        });
-                      }}
+      <div className="flex flex-1 min-h-0">
+        <div className="flex flex-col flex-1 min-w-0">
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="max-w-3xl mx-auto px-5 py-6 space-y-5">
+              {messages.length === 0 && (
+                <Empty
+                  icon={<ChatCircleDotsIcon size={32} />}
+                  title="Paste code, or tell me about your project"
+                  contents={
+                    <div className="flex flex-wrap justify-center gap-2">
+                      {[
+                        "Remember that this project is a TypeScript Worker deployed with Wrangler and GitHub Actions",
+                        "Review this: async function save(u){ const r = await fetch(API_URL+'/u', {method:'POST', body: JSON.stringify(u)}); try { return await r.json() } catch(e) {} console.log('saved', u) }",
+                        "Which Codex rules do you enforce?",
+                        "What do you remember about my project?"
+                      ].map((prompt) => (
+                        <Button
+                          key={prompt}
+                          variant="outline"
+                          size="sm"
+                          disabled={isStreaming}
+                          onClick={() => {
+                            sendMessage({
+                              role: "user",
+                              parts: [{ type: "text", text: prompt }]
+                            });
+                          }}
+                        >
+                          {prompt}
+                        </Button>
+                      ))}
+                    </div>
+                  }
+                />
+              )}
+
+              {messages.map((message: UIMessage, index: number) => {
+                const isUser = message.role === "user";
+                const isLastAssistant =
+                  message.role === "assistant" && index === messages.length - 1;
+
+                return (
+                  <div key={message.id} className="space-y-2">
+                    {showDebug && (
+                      <pre className="text-[11px] text-kumo-subtle bg-kumo-control rounded-lg p-3 overflow-auto max-h-64">
+                        {JSON.stringify(message, null, 2)}
+                      </pre>
+                    )}
+
+                    {/* Render parts in chronological (array) order */}
+                    {message.parts.map((part, i) => {
+                      const key = `${message.id}-${i}`;
+
+                      if (isToolUIPart(part)) {
+                        const retried =
+                          part.state === "output-error" &&
+                          message.parts
+                            .slice(i + 1)
+                            .some(
+                              (p) =>
+                                isToolUIPart(p) &&
+                                getToolName(p) === getToolName(part) &&
+                                p.state === "output-available"
+                            );
+                        return (
+                          <ToolPartView
+                            key={key}
+                            part={part}
+                            retried={retried}
+                            addToolApprovalResponse={addToolApprovalResponse}
+                          />
+                        );
+                      }
+
+                      if (part.type === "reasoning") {
+                        if (!part.text.trim()) return null;
+                        const isDone = part.state === "done" || !isStreaming;
+                        return (
+                          <div key={key} className="flex justify-start">
+                            <details
+                              className="max-w-[85%] w-full"
+                              open={!isDone}
+                            >
+                              <summary className="flex items-center gap-2 cursor-pointer px-3 py-2 rounded-lg bg-purple-500/10 border border-purple-500/20 text-sm select-none">
+                                <BrainIcon
+                                  size={14}
+                                  className="text-purple-400"
+                                />
+                                <span className="font-medium text-kumo-default">
+                                  Reasoning
+                                </span>
+                                {isDone ? (
+                                  <span className="text-xs text-kumo-success">
+                                    Complete
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-kumo-brand">
+                                    Thinking...
+                                  </span>
+                                )}
+                                <CaretDownIcon
+                                  size={14}
+                                  className="ml-auto text-kumo-inactive"
+                                />
+                              </summary>
+                              <pre className="mt-2 px-3 py-2 rounded-lg bg-kumo-control text-xs text-kumo-default whitespace-pre-wrap overflow-auto max-h-64">
+                                {part.text}
+                              </pre>
+                            </details>
+                          </div>
+                        );
+                      }
+
+                      if (
+                        part.type === "file" &&
+                        part.mediaType.startsWith("image/")
+                      ) {
+                        return (
+                          <div
+                            key={key}
+                            className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                          >
+                            <img
+                              src={part.url}
+                              alt="Attachment"
+                              className="max-h-64 rounded-xl border border-kumo-line object-contain"
+                            />
+                          </div>
+                        );
+                      }
+
+                      if (part.type === "text") {
+                        if (!part.text) return null;
+
+                        if (isUser) {
+                          return (
+                            <div key={key} className="flex justify-end">
+                              <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
+                                {part.text}
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div key={key} className="flex justify-start">
+                            <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
+                              <Streamdown
+                                className="sd-theme rounded-2xl rounded-bl-md p-3"
+                                plugins={{ code }}
+                                controls={false}
+                                isAnimating={isLastAssistant && isStreaming}
+                              >
+                                {part.text}
+                              </Streamdown>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      return null;
+                    })}
+                  </div>
+                );
+              })}
+
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+
+          {/* Input */}
+          <div className="border-t border-kumo-line bg-kumo-base">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                send();
+              }}
+              className="max-w-3xl mx-auto px-5 py-4"
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*"
+                aria-label="Upload image attachments"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files) addFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+
+              {attachments.length > 0 && (
+                <div className="flex gap-2 mb-2 flex-wrap">
+                  {attachments.map((att) => (
+                    <div
+                      key={att.id}
+                      className="relative group rounded-lg border border-kumo-line bg-kumo-control overflow-hidden"
                     >
-                      {prompt}
-                    </Button>
+                      <img
+                        src={att.preview}
+                        alt={att.file.name}
+                        className="h-16 w-16 object-cover"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(att.id)}
+                        className="absolute top-0.5 right-0.5 rounded-full bg-kumo-contrast/80 text-kumo-inverse p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                        aria-label={`Remove ${att.file.name}`}
+                      >
+                        <XIcon size={10} />
+                      </button>
+                    </div>
                   ))}
                 </div>
-              }
-            />
-          )}
+              )}
 
-          {messages.map((message: UIMessage, index: number) => {
-            const isUser = message.role === "user";
-            const isLastAssistant =
-              message.role === "assistant" && index === messages.length - 1;
-
-            return (
-              <div key={message.id} className="space-y-2">
-                {showDebug && (
-                  <pre className="text-[11px] text-kumo-subtle bg-kumo-control rounded-lg p-3 overflow-auto max-h-64">
-                    {JSON.stringify(message, null, 2)}
-                  </pre>
-                )}
-
-                {/* Render parts in chronological (array) order */}
-                {message.parts.map((part, i) => {
-                  const key = `${message.id}-${i}`;
-
-                  if (isToolUIPart(part)) {
-                    return (
-                      <ToolPartView
-                        key={key}
-                        part={part}
-                        addToolApprovalResponse={addToolApprovalResponse}
-                      />
-                    );
-                  }
-
-                  if (part.type === "reasoning") {
-                    if (!part.text.trim()) return null;
-                    const isDone = part.state === "done" || !isStreaming;
-                    return (
-                      <div key={key} className="flex justify-start">
-                        <details className="max-w-[85%] w-full" open={!isDone}>
-                          <summary className="flex items-center gap-2 cursor-pointer px-3 py-2 rounded-lg bg-purple-500/10 border border-purple-500/20 text-sm select-none">
-                            <BrainIcon size={14} className="text-purple-400" />
-                            <span className="font-medium text-kumo-default">
-                              Reasoning
-                            </span>
-                            {isDone ? (
-                              <span className="text-xs text-kumo-success">
-                                Complete
-                              </span>
-                            ) : (
-                              <span className="text-xs text-kumo-brand">
-                                Thinking...
-                              </span>
-                            )}
-                            <CaretDownIcon
-                              size={14}
-                              className="ml-auto text-kumo-inactive"
-                            />
-                          </summary>
-                          <pre className="mt-2 px-3 py-2 rounded-lg bg-kumo-control text-xs text-kumo-default whitespace-pre-wrap overflow-auto max-h-64">
-                            {part.text}
-                          </pre>
-                        </details>
-                      </div>
-                    );
-                  }
-
-                  if (
-                    part.type === "file" &&
-                    part.mediaType.startsWith("image/")
-                  ) {
-                    return (
-                      <div
-                        key={key}
-                        className={`flex ${isUser ? "justify-end" : "justify-start"}`}
-                      >
-                        <img
-                          src={part.url}
-                          alt="Attachment"
-                          className="max-h-64 rounded-xl border border-kumo-line object-contain"
-                        />
-                      </div>
-                    );
-                  }
-
-                  if (part.type === "text") {
-                    if (!part.text) return null;
-
-                    if (isUser) {
-                      return (
-                        <div key={key} className="flex justify-end">
-                          <div className="max-w-[85%] px-4 py-2.5 rounded-2xl rounded-br-md bg-kumo-contrast text-kumo-inverse leading-relaxed">
-                            {part.text}
-                          </div>
-                        </div>
-                      );
+              <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  shape="square"
+                  aria-label="Attach images"
+                  icon={<PaperclipIcon size={18} />}
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!connected || isStreaming}
+                  className="mb-0.5"
+                />
+                <InputArea
+                  ref={textareaRef}
+                  value={input}
+                  onValueChange={setInput}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      send();
                     }
-
-                    return (
-                      <div key={key} className="flex justify-start">
-                        <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
-                          <Streamdown
-                            className="sd-theme rounded-2xl rounded-bl-md p-3"
-                            plugins={{ code }}
-                            controls={false}
-                            isAnimating={isLastAssistant && isStreaming}
-                          >
-                            {part.text}
-                          </Streamdown>
-                        </div>
-                      </div>
-                    );
+                  }}
+                  onInput={(e) => {
+                    const el = e.currentTarget;
+                    el.style.height = "auto";
+                    el.style.height = `${el.scrollHeight}px`;
+                  }}
+                  onPaste={handlePaste}
+                  placeholder={
+                    attachments.length > 0
+                      ? "Add a message or send images..."
+                      : "Paste code to review, or tell me about your project..."
                   }
-
-                  return null;
-                })}
-              </div>
-            );
-          })}
-
-          <div ref={messagesEndRef} />
-        </div>
-      </div>
-
-      {/* Input */}
-      <div className="border-t border-kumo-line bg-kumo-base">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            send();
-          }}
-          className="max-w-3xl mx-auto px-5 py-4"
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept="image/*"
-            aria-label="Upload image attachments"
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files) addFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-
-          {attachments.length > 0 && (
-            <div className="flex gap-2 mb-2 flex-wrap">
-              {attachments.map((att) => (
-                <div
-                  key={att.id}
-                  className="relative group rounded-lg border border-kumo-line bg-kumo-control overflow-hidden"
-                >
-                  <img
-                    src={att.preview}
-                    alt={att.file.name}
-                    className="h-16 w-16 object-cover"
-                  />
-                  <button
+                  disabled={!connected || isStreaming}
+                  rows={1}
+                  className="flex-1 ring-0! focus:ring-0! shadow-none! bg-transparent! outline-none! resize-none max-h-40"
+                />
+                {isStreaming ? (
+                  <Button
                     type="button"
-                    onClick={() => removeAttachment(att.id)}
-                    className="absolute top-0.5 right-0.5 rounded-full bg-kumo-contrast/80 text-kumo-inverse p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
-                    aria-label={`Remove ${att.file.name}`}
-                  >
-                    <XIcon size={10} />
-                  </button>
-                </div>
-              ))}
+                    variant="secondary"
+                    shape="square"
+                    aria-label="Stop generation"
+                    icon={<StopIcon size={18} />}
+                    onClick={stop}
+                    className="mb-0.5"
+                  />
+                ) : (
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    shape="square"
+                    aria-label="Send message"
+                    disabled={
+                      (!input.trim() && attachments.length === 0) || !connected
+                    }
+                    icon={<PaperPlaneRightIcon size={18} />}
+                    className="mb-0.5"
+                  />
+                )}
+              </div>
+            </form>
+            <div className="flex justify-center pb-3">
+              <PoweredByCloudflare href="https://developers.cloudflare.com/agents/" />
             </div>
-          )}
-
-          <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
-            <Button
-              type="button"
-              variant="ghost"
-              shape="square"
-              aria-label="Attach images"
-              icon={<PaperclipIcon size={18} />}
-              onClick={() => fileInputRef.current?.click()}
-              disabled={!connected || isStreaming}
-              className="mb-0.5"
-            />
-            <InputArea
-              ref={textareaRef}
-              value={input}
-              onValueChange={setInput}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              onInput={(e) => {
-                const el = e.currentTarget;
-                el.style.height = "auto";
-                el.style.height = `${el.scrollHeight}px`;
-              }}
-              onPaste={handlePaste}
-              placeholder={
-                attachments.length > 0
-                  ? "Add a message or send images..."
-                  : "Paste code to review, or tell me about your project..."
-              }
-              disabled={!connected || isStreaming}
-              rows={1}
-              className="flex-1 ring-0! focus:ring-0! shadow-none! bg-transparent! outline-none! resize-none max-h-40"
-            />
-            {isStreaming ? (
-              <Button
-                type="button"
-                variant="secondary"
-                shape="square"
-                aria-label="Stop generation"
-                icon={<StopIcon size={18} />}
-                onClick={stop}
-                className="mb-0.5"
-              />
-            ) : (
-              <Button
-                type="submit"
-                variant="primary"
-                shape="square"
-                aria-label="Send message"
-                disabled={
-                  (!input.trim() && attachments.length === 0) || !connected
-                }
-                icon={<PaperPlaneRightIcon size={18} />}
-                className="mb-0.5"
-              />
-            )}
           </div>
-        </form>
-        <div className="flex justify-center pb-3">
-          <PoweredByCloudflare href="https://developers.cloudflare.com/agents/" />
         </div>
+        <SidePanel
+          state={panelState}
+          onForget={(id) => {
+            agent.stub
+              .forgetFact(id)
+              .catch((e: unknown) => console.error("forgetFact failed", e));
+          }}
+        />
       </div>
     </div>
   );

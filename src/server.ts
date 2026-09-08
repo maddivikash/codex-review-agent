@@ -4,10 +4,14 @@ import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
+  generateText,
+  NoSuchToolError,
   pruneMessages,
   stepCountIs,
   streamText,
-  tool
+  tool,
+  type ToolCallRepairFunction,
+  type ToolSet
 } from "ai";
 import { z } from "zod";
 import { describeRules, CODEX_RULES } from "./codex";
@@ -19,7 +23,23 @@ import {
 
 export { CodexReviewWorkflow };
 
-type FactRow = { id: string; topic: string; fact: string; created_at: string };
+export type FactRow = {
+  id: string;
+  topic: string;
+  fact: string;
+  created_at: string;
+};
+export type ReviewSummary = {
+  reviewId: string;
+  title: string;
+  language: string;
+  score: number;
+  verdict: ReviewResult["verdict"];
+  summary: string;
+  completedAt: string;
+};
+/** Synced to every connected browser so the side panel stays live. */
+export type AgentState = { facts: FactRow[]; reviews: ReviewSummary[] };
 type ReviewRow = {
   review_id: string;
   title: string;
@@ -31,7 +51,12 @@ type ReviewRow = {
   created_at: string;
 };
 
-const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// Chat orchestration needs reliable streamed tool calls. On Workers AI, Llama 3.3,
+// Llama 4 Scout and Qwen3 all emitted duplicated tool-argument deltas through the
+// AI SDK (see PROMPT_HISTORY.md), while gpt-oss-120b was clean every time. So chat
+// uses gpt-oss-120b and Llama 3.3 does the review step in the workflow, where it is
+// a plain generation call with no tools.
+const CHAT_MODEL = "@cf/openai/gpt-oss-120b";
 
 /**
  * Codex Review Agent.
@@ -40,7 +65,8 @@ const CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  * AIChatAgent; project facts and finished reviews live in the same SQLite
  * store so the agent remembers them across reloads and hibernation.
  */
-export class ChatAgent extends AIChatAgent<Env> {
+export class ChatAgent extends AIChatAgent<Env, AgentState> {
+  initialState: AgentState = { facts: [], reviews: [] };
   maxPersistedMessages = 100;
   chatRecovery = true;
   waitForMcpConnections = true;
@@ -62,6 +88,7 @@ export class ChatAgent extends AIChatAgent<Env> {
       payload TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`;
+    this.syncState();
 
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -86,6 +113,29 @@ export class ChatAgent extends AIChatAgent<Env> {
       .sql<FactRow>`SELECT id, topic, fact, created_at FROM project_facts ORDER BY created_at ASC`;
   }
 
+  private listReviewSummaries(limit = 20): ReviewSummary[] {
+    const rows = this
+      .sql<ReviewRow>`SELECT review_id, title, language, score, verdict, summary, created_at
+      FROM reviews ORDER BY created_at DESC LIMIT ${limit}`;
+    return rows.map((r) => ({
+      reviewId: r.review_id,
+      title: r.title,
+      language: r.language,
+      score: r.score,
+      verdict: r.verdict as ReviewResult["verdict"],
+      summary: r.summary,
+      completedAt: r.created_at
+    }));
+  }
+
+  /** Push facts and recent reviews to connected clients. */
+  private syncState() {
+    this.setState({
+      facts: this.listFacts(),
+      reviews: this.listReviewSummaries()
+    });
+  }
+
   private getReview(reviewId: string): ReviewResult | undefined {
     const rows = this
       .sql<ReviewRow>`SELECT * FROM reviews WHERE review_id = ${reviewId} LIMIT 1`;
@@ -100,6 +150,15 @@ export class ChatAgent extends AIChatAgent<Env> {
       (review_id, title, language, score, verdict, summary, payload, created_at)
       VALUES (${review.reviewId}, ${review.title}, ${review.language}, ${review.score},
               ${review.verdict}, ${review.summary}, ${JSON.stringify(review)}, ${review.completedAt})`;
+    this.syncState();
+  }
+
+  /** Delete a remembered fact from the side panel. */
+  @callable()
+  async forgetFact(id: string) {
+    this.sql`DELETE FROM project_facts WHERE id = ${id}`;
+    this.syncState();
+    return { id, deleted: true };
   }
 
   async onWorkflowComplete(
@@ -143,6 +202,36 @@ export class ChatAgent extends AIChatAgent<Env> {
   }
 
   // ---- chat -------------------------------------------------------------
+
+  /**
+   * Some Workers AI models occasionally stream tool arguments with duplicated
+   * fragments, which arrive as unparseable JSON. Instead of surfacing that as a
+   * failed tool call, ask Llama 3.3 (no tools, plain generation) to reconstruct
+   * the object against the tool's JSON schema. If the repair is not valid JSON
+   * the original error stands and the model retries on its own.
+   */
+  private repairToolCall(
+    workersai: ReturnType<typeof createWorkersAI>
+  ): ToolCallRepairFunction<ToolSet> {
+    return async ({ toolCall, inputSchema, error }) => {
+      if (NoSuchToolError.isInstance(error)) return null;
+      const schema = await inputSchema({ toolName: toolCall.toolName });
+      const { text } = await generateText({
+        model: workersai(REVIEW_MODEL),
+        system:
+          "You repair malformed JSON. The input is a JSON object whose text was corrupted by duplicated fragments while streaming. Return only the corrected JSON object that satisfies the schema. No prose, no code fences.",
+        prompt: `JSON schema:\n${JSON.stringify(schema)}\n\nMalformed input:\n${toolCall.input}`,
+        maxOutputTokens: 1500
+      });
+      const cleaned = text
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/, "");
+      JSON.parse(cleaned); // throws if still invalid, which keeps the original error
+      console.warn(`repaired tool call ${toolCall.toolName}`);
+      return { ...toolCall, input: cleaned };
+    };
+  }
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
@@ -261,9 +350,7 @@ If the user asks to schedule a task or a reminder, use the scheduleTask tool.`,
           description: "List past Codex reviews stored for this session.",
           inputSchema: z.object({}),
           execute: async () => {
-            const rows = this
-              .sql<ReviewRow>`SELECT review_id, title, language, score, verdict, summary, created_at
-              FROM reviews ORDER BY created_at DESC LIMIT 20`;
+            const rows = this.listReviewSummaries();
             return rows.length ? rows : "No reviews yet.";
           }
         }),
@@ -293,9 +380,20 @@ If the user asks to schedule a task or a reminder, use the scheduleTask tool.`,
             fact: z.string().describe("The fact to remember, in one sentence")
           }),
           execute: async ({ topic, fact }) => {
+            const existing = this.listFacts().find(
+              (f) => f.fact.trim().toLowerCase() === fact.trim().toLowerCase()
+            );
+            if (existing) {
+              return {
+                ...existing,
+                stored: false,
+                note: "Already remembered."
+              };
+            }
             const id = crypto.randomUUID().slice(0, 8);
             this.sql`INSERT INTO project_facts (id, topic, fact, created_at)
               VALUES (${id}, ${topic.toLowerCase()}, ${fact}, ${new Date().toISOString()})`;
+            this.syncState();
             return { id, topic, fact, stored: true };
           }
         }),
@@ -314,6 +412,7 @@ If the user asks to schedule a task or a reminder, use the scheduleTask tool.`,
           inputSchema: z.object({ id: z.string() }),
           execute: async ({ id }) => {
             this.sql`DELETE FROM project_facts WHERE id = ${id}`;
+            this.syncState();
             return { id, deleted: true };
           }
         }),
@@ -368,7 +467,16 @@ If the user asks to schedule a task or a reminder, use the scheduleTask tool.`,
         })
       },
       stopWhen: stepCountIs(10),
-      abortSignal: options?.abortSignal
+      experimental_repairToolCall: this.repairToolCall(workersai),
+      abortSignal: options?.abortSignal,
+      onError: ({ error }) => {
+        console.error(
+          "chat stream error",
+          error instanceof Error
+            ? `${error.name}: ${error.message}\n${error.stack}`
+            : JSON.stringify(error)
+        );
+      }
     });
 
     return result.toUIMessageStreamResponse();
